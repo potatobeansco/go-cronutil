@@ -38,7 +38,7 @@ var ErrMutexLocked = errors.New("mutex is locked")
 // It is designed for long-running jobs that are not executed too frequently. See also this package documentation.
 type Scheduler struct {
 	// A standard Redis client.
-	Client *redis.Client
+	Client redis.UniversalClient
 
 	// Polling period to try to acquire the lock.
 	PollingTime time.Duration
@@ -109,7 +109,7 @@ const DefaultPrefix = "cronutil"
 //
 // The execution time is stored in Redis with key "<prefix>:<id>" as UNIX epoch seconds.
 // Prefix can be changed as you wish, default to DefaultPrefix.
-func NewScheduler(id string, client *redis.Client, period time.Duration, pollingTime time.Duration, action func(context.Context) error) *Scheduler {
+func NewScheduler(id string, client redis.UniversalClient, period time.Duration, pollingTime time.Duration, action func(context.Context) error) *Scheduler {
 	s := &Scheduler{
 		Client:        client,
 		PollingTime:   pollingTime,
