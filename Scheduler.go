@@ -297,7 +297,7 @@ func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
 		return err
 	}
 
-	s.Logger.Tracef("sheculder `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
+	s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
 	return nil
 }
 
