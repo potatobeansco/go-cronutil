@@ -169,7 +169,9 @@ func (s *Scheduler) pollingFunc() {
 			}
 
 			if !time.Now().After(next) {
-				s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
+				if s.Period.Minutes() > 30 {
+					s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
+				}
 				return
 			}
 
@@ -202,7 +204,7 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 	}()
 
 	err := s.mu.LockContext(ctx)
-	if err != nil && err != redsync.ErrFailed {
+	if err != nil && !errors.Is(err, redsync.ErrFailed) {
 		s.Logger.Tracef("scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
 		s.sendToCh(err)
 		return
@@ -245,7 +247,7 @@ func (s *Scheduler) Ping() error {
 func (s *Scheduler) LockCtx(ctx context.Context) error {
 	err := s.mu.LockContext(ctx)
 	if err != nil {
-		if err == redsync.ErrFailed {
+		if errors.Is(err, redsync.ErrFailed) {
 			return ErrMutexLocked
 		}
 		return err
@@ -286,8 +288,7 @@ func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
 	j := int(math.Ceil(t.Seconds() * s.PeriodJitter))
 	delay := 0 * time.Second
 	if j > 0 {
-		rand.Seed(time.Now().UnixNano())
-		delay = time.Duration(rand.Intn(j)) * time.Second
+		delay = time.Duration(rand.New(rand.NewSource(time.Now().UnixNano())).Intn(j)) * time.Second
 	}
 
 	next := time.Now().Add(s.Period).Add(delay)
@@ -310,14 +311,16 @@ func (s *Scheduler) init() error {
 	defer cancel()
 
 	err := s.mu.LockContext(ctx)
-	if err != nil && err != redsync.ErrFailed {
+	if err != nil && !errors.Is(err, redsync.ErrFailed) {
 		s.Logger.Warnf("scheduler `%s` cannot acquire lock: %s", s.id, err.Error())
 		return err
 	}
-	if err == redsync.ErrFailed {
+
+	if errors.Is(err, redsync.ErrFailed) {
 		s.Logger.Warnf("scheduler `%s` redis mutex is locked, initializing anyway", s.id)
 		return nil
 	}
+
 	defer func() {
 		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer unlockCancel()
@@ -355,6 +358,9 @@ func (s *Scheduler) Start() error {
 	}
 
 	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
+	if s.Period.Minutes() <= 30 {
+		s.Logger.Tracef("scheduler `%s` is using short polling period, logging will be reduced", s.id)
+	}
 
 	s.mu = redsync.New(goredis.NewPool(s.Client)).NewMutex(s.mutexKey(), redsync.WithExpiry(s.ActionTimeout))
 
