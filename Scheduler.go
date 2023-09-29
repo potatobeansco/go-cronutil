@@ -169,7 +169,7 @@ func (s *Scheduler) pollingFunc() {
 			}
 
 			if !time.Now().After(next) {
-				if s.Period.Minutes() > 30 {
+				if s.PollingTime.Minutes() > 30 {
 					s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
 				}
 				return
@@ -298,7 +298,9 @@ func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
 		return err
 	}
 
-	s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
+	if s.PollingTime.Minutes() > 15 {
+		s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
+	}
 	return nil
 }
 
@@ -360,6 +362,10 @@ func (s *Scheduler) Start() error {
 	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
 	if s.Period.Minutes() <= 30 {
 		s.Logger.Tracef("scheduler `%s` is using short polling period, logging will be reduced", s.id)
+	}
+
+	if s.PollingTime.Minutes() <= 15 {
+		s.Logger.Tracef("scheduler `%s` is using short polling time, logging will be reduced", s.id)
 	}
 
 	s.mu = redsync.New(goredis.NewPool(s.Client)).NewMutex(s.mutexKey(), redsync.WithExpiry(s.ActionTimeout))
