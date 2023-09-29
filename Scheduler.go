@@ -361,7 +361,7 @@ func (s *Scheduler) Start() error {
 
 	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
 	if s.Period.Minutes() <= 30 {
-		s.Logger.Tracef("scheduler `%s` is using short polling period, logging will be reduced", s.id)
+		s.Logger.Tracef("scheduler `%s` is using short action period, logging will be reduced", s.id)
 	}
 
 	if s.PollingTime.Minutes() <= 15 {
