@@ -204,7 +204,7 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 	}()
 
 	err := s.mu.LockContext(ctx)
-	if err != nil && !errors.Is(err, redsync.ErrFailed) {
+	if err != nil {
 		s.Logger.Tracef("scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
 		s.sendToCh(err)
 		return
@@ -313,14 +313,16 @@ func (s *Scheduler) init() error {
 	defer cancel()
 
 	err := s.mu.LockContext(ctx)
-	if err != nil && !errors.Is(err, redsync.ErrFailed) {
+	if err != nil {
+		var et redsync.ErrTaken
+		var en redsync.ErrNodeTaken
+		if errors.As(err, &et) || errors.As(err, &en) {
+			s.Logger.Warnf("scheduler `%s` redis mutex is locked, initializing anyway", s.id)
+			return nil
+		}
+
 		s.Logger.Warnf("scheduler `%s` cannot acquire lock: %s", s.id, err.Error())
 		return err
-	}
-
-	if errors.Is(err, redsync.ErrFailed) {
-		s.Logger.Warnf("scheduler `%s` redis mutex is locked, initializing anyway", s.id)
-		return nil
 	}
 
 	defer func() {
