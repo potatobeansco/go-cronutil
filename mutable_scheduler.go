@@ -1,17 +1,3 @@
-// Package cronutil provides an extra light implementation of distributed cron scheduler.
-// The Scheduler guarantees that only one Scheduler can execute a given action at a time, and the action should be
-// executed periodically.
-//
-// It relies on Redis to store lock and the time schedule. It works by continuously polling Redis to check if the
-// time is up to execute an action and executes it if it is time. After executing, the time stored in Redis will be
-// updated to the next execution time. If during execution of the action, another scheduler (call it scheduler B) with the same id requests
-// to execute an action, it will hang until the execution by the original scheduler (call it scheduler A) is over.
-// Eventually when scheduler A has completed its action, it will update the next execution time and then release the lock,
-// causing scheduler B to check the execution time and determine that it is not the time to execute. This means, only
-// scheduler A will execute the given action, the other schedulers will execute their given actions when scheduler A
-// no longer requests a lock and updates next execution time in Redis (e.g. if scheduler A is down).
-//
-// See also documentation for NewScheduler.
 package cronutil
 
 import (
@@ -29,14 +15,13 @@ import (
 	"time"
 )
 
-var ErrMutexLocked = errors.New("mutex is locked")
-
-// Scheduler schedules action to be executed in periodically (determined by Period).
-// Due to the polling nature of the Scheduler, it cannot be used for quick jobs (less than a few seconds). Even with
-// very low polling time, it could result in too many lock requests which could waste resource. Due to the polling nature
-// action is not guaranteed to execute in the exact period time. It will probably miss by a few milliseconds to seconds.
-// It is designed for long-running jobs that are not executed too frequently. See also this package documentation.
-type Scheduler struct {
+// MutableScheduler works like Scheduler, but with initialPeriod shared across scheduler and can be modified at will.
+// This scheduler can also be paused, which will also pause all instances of the schedulers across all services.
+// Because it relies on storing period time in Redis together with pause status and mutex, it must have a very short
+// PollingTime. This is set to 5 seconds by default, the lowest resolution we currently support. You must make sure the network
+// also supports Redis polling in this short time. Although polling time can actually be set to any values, we
+// recommend that it is left at the default 5 seconds.
+type MutableScheduler struct {
 	// A standard Redis client.
 	Client redis.UniversalClient
 
@@ -47,14 +32,15 @@ type Scheduler struct {
 	ActionTimeout time.Duration
 
 	// The period of which the action should be executed.
-	Period time.Duration
+	// Only initial value, as period will be stored in Redis.
+	initialPeriod time.Duration
 
-	// PeriodJitter defines how much jitter delay needs to be added to the next action run time.
+	// initialPeriodJitter defines how much jitter delay needs to be added to the next action run time.
 	// It must be >= 0, while by default it is set to 0 (no jitter).
 	// In case jitter is set to 0.1, period will be multiplied by 0.1 and a random seconds are picked between 0 and
 	// period * period jitter. Chosen random seconds are then added to the next run time, preventing other schedulers
 	// to start at the same time.
-	PeriodJitter float64
+	initialPeriodJitter float64
 
 	// The poller schedules polling to Redis to acquire lock and execute action.
 	poller *gocron.Scheduler
@@ -85,46 +71,27 @@ type Scheduler struct {
 	cancelMu sync.Mutex
 }
 
-const DefaultPrefix = "cronutil"
-
-// NewScheduler creates a new scheduler. See also the package documentation and Scheduler type documentation.
-// You should store and consume the error channel by calling Scheduler.Err().
-// All Schedulers that share the same action must have the exact same period parameter. Otherwise, it will result
-// in unpredictable scheduling due to unpredictable next execution time in Redis.
-// The "id" is the id of the job, and will have to match the other schedulers that execute the same action.
-// period determines the duration between action execution.
-// pollingTime determines the period of which the Scheduler polls Redis for lock and execution time. pollingTime is
-// typically a few seconds, and can be longer for long-running jobs that are not executed frequently. pollingTime of
-// 10 seconds means that the Scheduler will ask Redis if it's the right time to execute the given action every 10 seconds.
-// context is given to the action function, which will have a timeout context given to it. The timeout is determined
-// by Scheduler.ActionTimeout (default to 30 seconds), which can be changed.
-//
-// It is obvious that period must be > pollingTime, and will give panic if period is <= pollingTime.
-//
-// It is possible to give different pollingTime and action. pollingTime can be differentiated for example to reduce
-// the possibility of multiple services asking for the same lock at the same time. But as start time of different
-// Schedulers are often different, we suggest keeping the pollingTime the same as other Schedulers. action can be
-// different for each scheduler, and there is no way to enforce them across multiple Schedulers. However, it is obvious
-// that all Schedulers should execute the same kind of actions.
-//
-// The execution time is stored in Redis with key "<prefix>:<id>" as UNIX epoch seconds.
-// Prefix can be changed as you wish, default to DefaultPrefix.
-func NewScheduler(id string, client redis.UniversalClient, period time.Duration, pollingTime time.Duration, action func(context.Context) error) *Scheduler {
-	s := &Scheduler{
-		Client:        client,
-		PollingTime:   pollingTime,
-		ActionTimeout: 30 * time.Second,
-		Period:        period,
-		PeriodJitter:  0,
-		errCh:         make(chan error, 256),
-		Prefix:        DefaultPrefix,
-		id:            id,
-		action:        action,
-		Logger:        logutil.NewStdLogger(false, "cronutil"),
-		once:          &sync.Once{},
+// NewMutableScheduler creates a new mutable scheduler.
+// initialPeriod must be set, to the same values set to all schedulers. This value is used only in the beginning,
+// when the first scheduler is started and it initializes the period config in Redis. All other schedulers will
+// then follow the period config set in Redis, until one of them call a function to update the period (and period
+// jitter).
+func NewMutableScheduler(id string, client redis.UniversalClient, initialPeriod time.Duration, action func(context.Context) error) *MutableScheduler {
+	s := &MutableScheduler{
+		Client:              client,
+		PollingTime:         5 * time.Second,
+		ActionTimeout:       30 * time.Second,
+		initialPeriod:       initialPeriod,
+		initialPeriodJitter: 0,
+		errCh:               make(chan error, 256),
+		Prefix:              defaultPrefix,
+		id:                  id,
+		action:              action,
+		Logger:              logutil.NewStdLogger(false, "cronutil"),
+		once:                &sync.Once{},
 	}
 
-	if s.Period <= s.PollingTime {
+	if s.initialPeriod <= s.PollingTime {
 		panic("period must be >= polling time")
 	}
 	s.poller = gocron.NewScheduler(time.UTC)
@@ -133,17 +100,32 @@ func NewScheduler(id string, client redis.UniversalClient, period time.Duration,
 }
 
 // key returns the key to the entry that contains the next execution time in Redis.
-func (s *Scheduler) key() string {
+func (s *MutableScheduler) key() string {
 	return fmt.Sprintf("%s:%s", s.Prefix, s.id)
 }
 
 // mutexKey returns the key to the entry that contains the mutex lock data in Redis.
-func (s *Scheduler) mutexKey() string {
+func (s *MutableScheduler) mutexKey() string {
 	return fmt.Sprintf("%s:mutex:%s", s.Prefix, s.id)
 }
 
+// periodKey returns the key to the entry that contains the period configuration time in Redis.
+func (s *MutableScheduler) periodKey() string {
+	return fmt.Sprintf("%s:period:%s", s.Prefix, s.id)
+}
+
+// jitterKey returns the key to the entry that contains the period configuration time in Redis.
+func (s *MutableScheduler) jitterKey() string {
+	return fmt.Sprintf("%s:jitter:%s", s.Prefix, s.id)
+}
+
+// activeKey returns the key to the entry that contains the active status in Redis.
+func (s *MutableScheduler) activeKey() string {
+	return fmt.Sprintf("%s:active:%s", s.Prefix, s.id)
+}
+
 // sendToCh sends an error to the error channel.
-func (s *Scheduler) sendToCh(err error) {
+func (s *MutableScheduler) sendToCh(err error) {
 	select {
 	case s.errCh <- err:
 	default:
@@ -154,22 +136,35 @@ func (s *Scheduler) sendToCh(err error) {
 // pollingFunc is the polling function that is executed by the internal timer.
 // It will try to acquire Redis lock and will check if it is time to execute.
 // The action is executed inside this function when it is time to execute.
-// This will then set the next execution time to current time + Period.
-func (s *Scheduler) pollingFunc() {
+// This will then set the next execution time to current time + initialPeriod.
+func (s *MutableScheduler) pollingFunc() {
 	s.once.Do(func() {
 		defer func() {
 			s.once = &sync.Once{}
 		}()
 
 		s.runWithLock(func(ctx context.Context) {
-			next, err := s.getNextExecTime(ctx)
-			if err != nil && err != redis.Nil {
+			isPaused, err := s.isPaused(ctx)
+			if err != nil {
 				s.sendToCh(err)
 				return
 			}
 
+			if isPaused {
+				s.Logger.Trace("scheduler is paused, skipping action")
+				return
+			}
+
+			next, err := s.getNextExecTime(ctx)
+			if err != nil && !errors.Is(err, redis.Nil) {
+				s.sendToCh(err)
+				return
+			}
+
+			err = nil
+
 			if !time.Now().After(next) {
-				if s.PollingTime.Minutes() > 30 {
+				if s.PollingTime.Minutes() > 15 {
 					s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
 				}
 				return
@@ -181,7 +176,7 @@ func (s *Scheduler) pollingFunc() {
 				return
 			}
 
-			err = s.setNextExecTime(ctx)
+			err = s.setNextExecTimeAuto(ctx)
 			if err != nil {
 				s.sendToCh(err)
 				return
@@ -191,7 +186,7 @@ func (s *Scheduler) pollingFunc() {
 }
 
 // runWithLock wraps f to be run with a Redis lock and sets its cancellation to cancel.
-func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
+func (s *MutableScheduler) runWithLock(f func(ctx context.Context)) {
 	s.cancelMu.Lock()
 	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
 	s.cancel = cancel
@@ -225,12 +220,12 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 
 // Err returns the error channel.
 // This error channel should be consumed to avoid getting too many errors in the channel.
-func (s *Scheduler) Err() <-chan error {
+func (s *MutableScheduler) Err() <-chan error {
 	return s.errCh
 }
 
 // Ping pings Redis to check the connection.
-func (s *Scheduler) Ping() error {
+func (s *MutableScheduler) Ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
 	defer cancel()
 	err := s.Client.Ping(ctx).Err()
@@ -244,7 +239,7 @@ func (s *Scheduler) Ping() error {
 // LockCtx manually locks the distributed mutex, effectively pausing this scheduler, until the lock is released again.
 // If err is returned, that means the lock cannot be acquired, and the action will continue. The poller will also be stopped,
 // but can be rerun with UnlockCtx.
-func (s *Scheduler) LockCtx(ctx context.Context) error {
+func (s *MutableScheduler) LockCtx(ctx context.Context) error {
 	err := s.mu.LockContext(ctx)
 	if err != nil {
 		if errors.Is(err, redsync.ErrFailed) {
@@ -257,7 +252,7 @@ func (s *Scheduler) LockCtx(ctx context.Context) error {
 }
 
 // UnlockCtx manually releases the distributed mutex.
-func (s *Scheduler) UnlockCtx(ctx context.Context) error {
+func (s *MutableScheduler) UnlockCtx(ctx context.Context) error {
 	_, err := s.mu.UnlockContext(ctx)
 	if !s.poller.IsRunning() {
 		s.poller.StartAsync()
@@ -265,16 +260,81 @@ func (s *Scheduler) UnlockCtx(ctx context.Context) error {
 	return err
 }
 
+// setPeriodConfig updates the period config in Redis.
+func (s *MutableScheduler) setPeriodConfig(ctx context.Context, period time.Duration, jitter float64) (err error) {
+	err = s.Client.Set(ctx, s.periodKey(), int(period.Seconds()), 0).Err()
+	if err != nil {
+		return err
+	}
+
+	err = s.Client.Set(ctx, s.jitterKey(), jitter, 0).Err()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// getPeriodConfig retrieves period and period jitter from Redis.
+func (s *MutableScheduler) getPeriodConfig(ctx context.Context) (period time.Duration, jitter float64, err error) {
+	cmd := s.Client.Get(ctx, s.periodKey())
+	periodInt, err := cmd.Int()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return 0, 0, err
+	}
+
+	period = time.Duration(periodInt) * time.Second
+	if errors.Is(err, redis.Nil) || periodInt > 24*60 { // Period is invalid (too big)
+		period = s.initialPeriod
+
+		err = s.Client.Set(ctx, s.periodKey(), int(s.initialPeriod.Seconds()), 0).Err()
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	cmd = s.Client.Get(ctx, s.jitterKey())
+	jitter, err = cmd.Float64()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return 0, 0, err
+	}
+
+	if errors.Is(err, redis.Nil) {
+		jitter = s.initialPeriodJitter
+
+		err = s.Client.Set(ctx, s.jitterKey(), s.initialPeriodJitter, 0).Err()
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	return period, jitter, nil
+}
+
+// isPaused checks if scheduler is paused.
+func (s *MutableScheduler) isPaused(ctx context.Context) (isPaused bool, err error) {
+	isActive, err := s.Client.Get(ctx, s.activeKey()).Bool()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return false, err
+	}
+
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+
+	return !isActive, nil
+}
+
 // getNextExecTime retrieves the next execution time from Redis.
 // It may return redis.Nil error, which indicates that there is no execution time stored in Redis.
-func (s *Scheduler) getNextExecTime(ctx context.Context) (next time.Time, err error) {
+func (s *MutableScheduler) getNextExecTime(ctx context.Context) (next time.Time, err error) {
 	cmd := s.Client.Get(ctx, s.key())
 	result, err := cmd.Int64()
-	if err != nil && err != redis.Nil {
+	if err != nil && !errors.Is(err, redis.Nil) {
 		s.Logger.Warnf("scheduler `%s` cannot retrieve run schedule time from Redis: %s", s.id, err.Error())
 		return time.Time{}, err
 	}
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return time.Time{}, redis.Nil
 	}
 
@@ -283,32 +343,46 @@ func (s *Scheduler) getNextExecTime(ctx context.Context) (next time.Time, err er
 }
 
 // setNextExecTime sets the next execution time in Redis.
-func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
-	t := s.Period
-	j := int(math.Ceil(t.Seconds() * s.PeriodJitter))
+func (s *MutableScheduler) setNextExecTimeAuto(ctx context.Context) (err error) {
+	t, jitter, err := s.getPeriodConfig(ctx)
+	if err != nil {
+		return err
+	}
+
+	j := int(math.Ceil(t.Seconds() * jitter))
 	delay := 0 * time.Second
 	if j > 0 {
 		delay = time.Duration(rand.New(rand.NewSource(time.Now().UnixNano())).Intn(j)) * time.Second
 	}
 
-	next := time.Now().Add(s.Period).Add(delay)
+	next := time.Now().Add(t).Add(delay)
+	err = s.setNextExecTime(ctx, next)
+	if err != nil {
+		return err
+	}
+
+	//if s.PollingTime.Minutes() > 15 {
+	s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
+	//}
+	return nil
+}
+
+// setNextExecTime updates the next run time in Redis with custom run time.
+func (s *MutableScheduler) setNextExecTime(ctx context.Context, next time.Time) (err error) {
 	err = s.Client.Set(ctx, s.key(), next.Unix(), 0).Err()
 	if err != nil {
 		s.Logger.Warnf("scheduler `%s` cannot set initialization time in Redis: %s", s.id, err.Error())
 		return err
 	}
 
-	if s.PollingTime.Minutes() > 15 {
-		s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
-	}
-	return nil
+	return err
 }
 
 // init initializes next execution time.
 // It first checks Redis if next execution time has been registered in Redis. If it has been registered, it will just
 // do nothing, so that the current next execution time is not overwritten. Otherwise, it will set next execution time
 // in Redis to (time.Now() + Scheduler.Period).
-func (s *Scheduler) init() error {
+func (s *MutableScheduler) init() error {
 	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
 	defer cancel()
 
@@ -336,8 +410,9 @@ func (s *Scheduler) init() error {
 	}()
 
 	_, err = s.getNextExecTime(ctx)
-	if err == redis.Nil {
-		err = s.setNextExecTime(ctx)
+	if errors.Is(err, redis.Nil) {
+		s.Logger.Tracef("scheduler `%s` has no next exec time, setting", s.id)
+		err = s.setNextExecTimeAuto(ctx)
 		if err != nil {
 			return err
 		}
@@ -353,7 +428,7 @@ func (s *Scheduler) init() error {
 // in the next period.
 //
 // If Start fails, the error channel will be closed.
-func (s *Scheduler) Start() error {
+func (s *MutableScheduler) Start() error {
 	defer close(s.errCh)
 
 	err := s.Ping()
@@ -362,7 +437,7 @@ func (s *Scheduler) Start() error {
 	}
 
 	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
-	if s.Period.Minutes() <= 30 {
+	if s.initialPeriod.Minutes() <= 30 {
 		s.Logger.Tracef("scheduler `%s` is using short action period, logging will be reduced", s.id)
 	}
 
@@ -382,7 +457,7 @@ func (s *Scheduler) Start() error {
 }
 
 // Stop stops the scheduler and closes the error channel.
-func (s *Scheduler) Stop() {
+func (s *MutableScheduler) Stop() {
 	s.cancelMu.Lock()
 	if s.cancel != nil {
 		s.cancel()
@@ -403,7 +478,7 @@ func (s *Scheduler) Stop() {
 }
 
 // Trigger triggers the execution of action immediately, resetting the timer on action completion.
-func (s *Scheduler) Trigger() {
+func (s *MutableScheduler) Trigger() {
 	s.once.Do(func() {
 		defer func() {
 			s.once = &sync.Once{}
@@ -416,7 +491,7 @@ func (s *Scheduler) Trigger() {
 				return
 			}
 
-			err = s.setNextExecTime(ctx)
+			err = s.setNextExecTimeAuto(ctx)
 			if err != nil {
 				s.sendToCh(err)
 				return
@@ -425,10 +500,76 @@ func (s *Scheduler) Trigger() {
 	})
 }
 
-// Reset manually resets the next execution schedule to current time + Period.
-func (s *Scheduler) Reset() {
+// UpdatePeriod updates period config, resetting the next run time.
+func (s *MutableScheduler) UpdatePeriod(period time.Duration, jitter float64) (err error) {
+	if period <= s.ActionTimeout {
+		return errors.New("period must be > action timeout")
+	}
+
+	if period <= s.PollingTime {
+		return errors.New("period must be > polling time")
+	}
+
 	s.runWithLock(func(ctx context.Context) {
-		err := s.setNextExecTime(ctx)
+		err = s.setPeriodConfig(ctx, period, jitter)
+		if err != nil {
+			return
+		}
+
+		j := int(math.Ceil(period.Seconds() * jitter))
+		delay := 0 * time.Second
+		if j > 0 {
+			delay = time.Duration(rand.New(rand.NewSource(time.Now().UnixNano())).Intn(j)) * time.Second
+		}
+
+		next := time.Now().Add(period).Add(delay)
+		err = s.setNextExecTime(ctx, next)
+		if err != nil {
+			return
+		}
+
+		s.Logger.Tracef("scheduler %s next execution time has been updated to %s following request to update period/jitter to %.2f/%.2f", s.id, next.Format(time.RFC3339), period.Seconds(), jitter)
+	})
+
+	return err
+}
+
+// Pause sets active status to false.
+func (s *MutableScheduler) Pause() (err error) {
+	err = s.Client.Set(context.Background(), s.activeKey(), false, 0).Err()
+	if err != nil {
+		return
+	}
+
+	s.Logger.Tracef("schedluer %s is paused", s.id)
+
+	return err
+}
+
+// Unpause sets the timer setting to active.
+// When unpausing, the timer is like recreated again and so the next run time will be set to next period.
+func (s *MutableScheduler) Unpause() (err error) {
+	s.runWithLock(func(ctx context.Context) {
+		err = s.Client.Set(ctx, s.activeKey(), true, 0).Err()
+		if err != nil {
+			return
+		}
+
+		s.Logger.Tracef("schedluer %s is unpaused, next exec time is reset", s.id)
+
+		err = s.setNextExecTimeAuto(ctx)
+		if err != nil {
+			return
+		}
+	})
+
+	return err
+}
+
+// Reset manually resets the next execution schedule to current time + initialPeriod.
+func (s *MutableScheduler) Reset() {
+	s.runWithLock(func(ctx context.Context) {
+		err := s.setNextExecTimeAuto(ctx)
 		if err != nil {
 			s.sendToCh(err)
 			return
