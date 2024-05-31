@@ -319,7 +319,7 @@ func (s *MutableScheduler) isPaused(ctx context.Context) (isPaused bool, err err
 	}
 
 	if errors.Is(err, redis.Nil) {
-		return false, nil
+		return true, nil
 	}
 
 	return !isActive, nil
