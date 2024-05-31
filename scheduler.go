@@ -296,8 +296,8 @@ func (s *Scheduler) init() error {
 
 	err := s.mu.LockContext(ctx)
 	if err != nil {
-		var et redsync.ErrTaken
-		var en redsync.ErrNodeTaken
+		et := &redsync.ErrTaken{}
+		en := &redsync.ErrNodeTaken{}
 		if errors.As(err, &et) || errors.As(err, &en) {
 			s.Logger.Warnf("scheduler `%s` redis mutex is locked, initializing anyway", s.id)
 			return nil
