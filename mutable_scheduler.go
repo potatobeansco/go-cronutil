@@ -151,7 +151,9 @@ func (s *MutableScheduler) pollingFunc() {
 			}
 
 			if isPaused {
-				s.Logger.Trace("scheduler is paused, skipping action")
+				if s.PollingTime.Minutes() > 15 {
+					s.Logger.Tracef("scheduler `%s` is paused, skipping action", s.id)
+				}
 				return
 			}
 
