@@ -144,6 +144,17 @@ func (s *MutableScheduler) pollingFunc() {
 		}()
 
 		s.runWithLock(func(ctx context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					if err, ok := r.(error); ok {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %w", err))
+					} else {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %v", r))
+					}
+					return
+				}
+			}()
+
 			isPaused, err := s.isPaused(ctx)
 			if err != nil {
 				s.sendToCh(err)
@@ -487,6 +498,17 @@ func (s *MutableScheduler) Trigger() {
 		}()
 
 		s.runWithLock(func(ctx context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					if err, ok := r.(error); ok {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %w", err))
+					} else {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %v", r))
+					}
+					return
+				}
+			}()
+
 			err := s.action(ctx)
 			if err != nil {
 				s.sendToCh(err)

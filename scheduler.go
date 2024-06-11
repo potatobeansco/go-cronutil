@@ -144,6 +144,17 @@ func (s *Scheduler) pollingFunc() {
 		}()
 
 		s.runWithLock(func(ctx context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					if err, ok := r.(error); ok {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %w", err))
+					} else {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %v", r))
+					}
+					return
+				}
+			}()
+
 			next, err := s.getNextExecTime(ctx)
 			if err != nil && !errors.Is(err, redis.Nil) {
 				s.sendToCh(err)
@@ -392,6 +403,17 @@ func (s *Scheduler) Trigger() {
 		}()
 
 		s.runWithLock(func(ctx context.Context) {
+			defer func() {
+				if r := recover(); r != nil {
+					if err, ok := r.(error); ok {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %w", err))
+					} else {
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %v", r))
+					}
+					return
+				}
+			}()
+
 			err := s.action(ctx)
 			if err != nil {
 				s.sendToCh(err)
