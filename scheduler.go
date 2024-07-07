@@ -67,6 +67,8 @@ type Scheduler struct {
 	// Store cancel function to cancel action when we want to stop the scheduler so we don't have to wait.
 	cancel   context.CancelFunc
 	cancelMu sync.Mutex
+
+	AlwaysLog bool
 }
 
 // NewScheduler creates a new scheduler. See also the package documentation and Scheduler type documentation.
@@ -162,7 +164,7 @@ func (s *Scheduler) pollingFunc() {
 			}
 
 			if !time.Now().After(next) {
-				if s.PollingTime.Minutes() > 15 {
+				if s.AlwaysLog || s.PollingTime.Minutes() > 15 {
 					s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
 				}
 				return
@@ -228,7 +230,7 @@ func (s *Scheduler) Ping() error {
 	defer cancel()
 	err := s.Client.Ping(ctx).Err()
 	if err != nil {
-		s.Logger.Warnf("scheduler `%s` cannot ping Redis: %w", s.id, err)
+		s.Logger.Warnf("scheduler `%s` cannot ping Redis: %s", s.id, err.Error())
 		return err
 	}
 	return nil
@@ -291,7 +293,7 @@ func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
 		return err
 	}
 
-	if s.PollingTime.Minutes() > 15 {
+	if s.AlwaysLog || s.PollingTime.Minutes() > 15 {
 		s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
 	}
 	return nil
@@ -355,11 +357,7 @@ func (s *Scheduler) Start() error {
 	}
 
 	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
-	if s.Period.Minutes() <= 30 {
-		s.Logger.Tracef("scheduler `%s` is using short action period, logging will be reduced", s.id)
-	}
-
-	if s.PollingTime.Minutes() <= 15 {
+	if !s.AlwaysLog && s.PollingTime.Minutes() <= 15 {
 		s.Logger.Tracef("scheduler `%s` is using short polling time, logging will be reduced", s.id)
 	}
 
