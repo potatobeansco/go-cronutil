@@ -9,6 +9,8 @@ import (
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"math"
 	"math/rand"
 	"sync"
@@ -69,6 +71,8 @@ type MutableScheduler struct {
 	// Store cancel function to cancel action when we want to stop the scheduler so we don't have to wait.
 	cancel   context.CancelFunc
 	cancelMu sync.Mutex
+
+	tracer trace.Tracer
 }
 
 // NewMutableScheduler creates a new mutable scheduler.
@@ -90,6 +94,9 @@ func NewMutableScheduler(id string, client redis.UniversalClient, initialPeriod 
 		Logger:              logutil.NewStdLogger(false, "cronutil"),
 		once:                &sync.Once{},
 	}
+
+	tp := otel.GetTracerProvider()
+	s.tracer = tp.Tracer("git.padmadigital.id/potato/go-cronutil")
 
 	if s.initialPeriod <= s.PollingTime {
 		panic("period must be >= polling time")
@@ -204,6 +211,9 @@ func (s *MutableScheduler) runWithLock(f func(ctx context.Context)) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
 	s.cancel = cancel
 	s.cancelMu.Unlock()
+	ctx, span := s.tracer.Start(ctx, fmt.Sprintf("scheduler.%s.run", s.id))
+	defer span.End()
+
 	defer func() {
 		s.cancelMu.Lock()
 		defer s.cancelMu.Unlock()
@@ -219,7 +229,7 @@ func (s *MutableScheduler) runWithLock(f func(ctx context.Context)) {
 	}
 
 	defer func() {
-		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		unlockCtx, unlockCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
@@ -238,9 +248,7 @@ func (s *MutableScheduler) Err() <-chan error {
 }
 
 // Ping pings Redis to check the connection.
-func (s *MutableScheduler) Ping() error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
-	defer cancel()
+func (s *MutableScheduler) Ping(ctx context.Context) error {
 	err := s.Client.Ping(ctx).Err()
 	if err != nil {
 		s.Logger.Warnf("scheduler `%s` cannot ping Redis: %w", s.id, err)
@@ -395,10 +403,7 @@ func (s *MutableScheduler) setNextExecTime(ctx context.Context, next time.Time) 
 // It first checks Redis if next execution time has been registered in Redis. If it has been registered, it will just
 // do nothing, so that the current next execution time is not overwritten. Otherwise, it will set next execution time
 // in Redis to (time.Now() + Scheduler.Period).
-func (s *MutableScheduler) init() error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
-	defer cancel()
-
+func (s *MutableScheduler) init(ctx context.Context) error {
 	err := s.mu.LockContext(ctx)
 	if err != nil {
 		et := &redsync.ErrTaken{}
@@ -442,9 +447,15 @@ func (s *MutableScheduler) init() error {
 //
 // If Start fails, the error channel will be closed.
 func (s *MutableScheduler) Start() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
+	defer cancel()
+
+	ctx, span := s.tracer.Start(ctx, fmt.Sprintf("scheduler.%s.start", s.id))
+	defer span.End()
+
 	defer close(s.errCh)
 
-	err := s.Ping()
+	err := s.Ping(ctx)
 	if err != nil {
 		return err
 	}
@@ -460,7 +471,7 @@ func (s *MutableScheduler) Start() error {
 
 	s.mu = redsync.New(goredis.NewPool(s.Client)).NewMutex(s.mutexKey(), redsync.WithExpiry(s.ActionTimeout))
 
-	err = s.init()
+	err = s.init(ctx)
 	if err != nil {
 		return err
 	}

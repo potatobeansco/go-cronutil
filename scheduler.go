@@ -9,6 +9,8 @@ import (
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 	"math"
 	"math/rand"
 	"sync"
@@ -69,6 +71,8 @@ type Scheduler struct {
 	cancelMu sync.Mutex
 
 	AlwaysLog bool
+
+	tracer trace.Tracer
 }
 
 // NewScheduler creates a new scheduler. See also the package documentation and Scheduler type documentation.
@@ -107,6 +111,9 @@ func NewScheduler(id string, client redis.UniversalClient, period time.Duration,
 		Logger:        logutil.NewStdLogger(false, "cronutil"),
 		once:          &sync.Once{},
 	}
+
+	tp := otel.GetTracerProvider()
+	s.tracer = tp.Tracer("git.padmadigital.id/potato/go-cronutil")
 
 	if s.Period <= s.PollingTime {
 		panic("period must be >= polling time")
@@ -191,6 +198,9 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
 	s.cancel = cancel
 	s.cancelMu.Unlock()
+	ctx, span := s.tracer.Start(ctx, fmt.Sprintf("scheduler.%s.run", s.id))
+	defer span.End()
+
 	defer func() {
 		s.cancelMu.Lock()
 		defer s.cancelMu.Unlock()
@@ -206,7 +216,7 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 	}
 
 	defer func() {
-		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		unlockCtx, unlockCancel := context.WithTimeout(ctx, 10*time.Second)
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
@@ -225,9 +235,7 @@ func (s *Scheduler) Err() <-chan error {
 }
 
 // Ping pings Redis to check the connection.
-func (s *Scheduler) Ping() error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
-	defer cancel()
+func (s *Scheduler) Ping(ctx context.Context) error {
 	err := s.Client.Ping(ctx).Err()
 	if err != nil {
 		s.Logger.Warnf("scheduler `%s` cannot ping Redis: %s", s.id, err.Error())
@@ -303,10 +311,7 @@ func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
 // It first checks Redis if next execution time has been registered in Redis. If it has been registered, it will just
 // do nothing, so that the current next execution time is not overwritten. Otherwise, it will set next execution time
 // in Redis to (time.Now() + Scheduler.Period).
-func (s *Scheduler) init() error {
-	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
-	defer cancel()
-
+func (s *Scheduler) init(ctx context.Context) error {
 	err := s.mu.LockContext(ctx)
 	if err != nil {
 		et := &redsync.ErrTaken{}
@@ -349,9 +354,15 @@ func (s *Scheduler) init() error {
 //
 // If Start fails, the error channel will be closed.
 func (s *Scheduler) Start() error {
+	ctx, cancel := context.WithTimeout(context.Background(), s.ActionTimeout)
+	defer cancel()
+
+	ctx, span := s.tracer.Start(ctx, fmt.Sprintf("scheduler.%s.start", s.id))
+	defer span.End()
+
 	defer close(s.errCh)
 
-	err := s.Ping()
+	err := s.Ping(ctx)
 	if err != nil {
 		return err
 	}
@@ -363,7 +374,7 @@ func (s *Scheduler) Start() error {
 
 	s.mu = redsync.New(goredis.NewPool(s.Client)).NewMutex(s.mutexKey(), redsync.WithExpiry(s.ActionTimeout))
 
-	err = s.init()
+	err = s.init(ctx)
 	if err != nil {
 		return err
 	}
@@ -387,6 +398,8 @@ func (s *Scheduler) Stop() {
 
 	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer unlockCancel()
+	unlockCtx, span := s.tracer.Start(unlockCtx, fmt.Sprintf("scheduler.%s.start", s.id))
+	defer span.End()
 	_, err := s.mu.UnlockContext(unlockCtx)
 	if err != nil {
 		s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s, continuing anyway", s.id, err.Error())
