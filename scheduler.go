@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"math"
 	"math/rand"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -156,9 +157,9 @@ func (s *Scheduler) pollingFunc() {
 			defer func() {
 				if r := recover(); r != nil {
 					if err, ok := r.(error); ok {
-						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %w", err))
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %w, stack trace: %s", err, string(debug.Stack())))
 					} else {
-						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %v", r))
+						s.sendToCh(fmt.Errorf("action in scheduler encountered panic: %v, stack trace: %s", r, string(debug.Stack())))
 					}
 					return
 				}
