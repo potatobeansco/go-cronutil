@@ -229,7 +229,7 @@ func (s *MutableScheduler) runWithLock(f func(ctx context.Context)) {
 	}
 
 	defer func() {
-		unlockCtx, unlockCancel := context.WithTimeout(ctx, 10*time.Second)
+		unlockCtx, unlockCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
@@ -418,7 +418,7 @@ func (s *MutableScheduler) init(ctx context.Context) error {
 	}
 
 	defer func() {
-		unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		unlockCtx, unlockCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
@@ -495,6 +495,8 @@ func (s *MutableScheduler) Stop() {
 
 	unlockCtx, unlockCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer unlockCancel()
+	unlockCtx, span := s.tracer.Start(unlockCtx, fmt.Sprintf("scheduler.%s.stop", s.id))
+	defer span.End()
 	_, err := s.mu.UnlockContext(unlockCtx)
 	if err != nil {
 		s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s, continuing anyway", s.id, err.Error())
