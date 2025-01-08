@@ -401,6 +401,9 @@ func (s *Scheduler) Stop() {
 	defer unlockCancel()
 	unlockCtx, span := s.tracer.Start(unlockCtx, fmt.Sprintf("scheduler.%s.stop", s.id))
 	defer span.End()
+	if s.mu == nil {
+		return
+	}
 	_, err := s.mu.UnlockContext(unlockCtx)
 	if err != nil {
 		s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s, continuing anyway", s.id, err.Error())
