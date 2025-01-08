@@ -212,7 +212,11 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 	err := s.mu.LockContext(ctx)
 	if err != nil {
 		s.Logger.Tracef("scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
-		s.sendToCh(err)
+		et := &redsync.ErrTaken{}
+		en := &redsync.ErrNodeTaken{}
+		if !errors.As(err, &et) && !errors.As(err, &en) {
+			s.sendToCh(err)
+		}
 		return
 	}
 
