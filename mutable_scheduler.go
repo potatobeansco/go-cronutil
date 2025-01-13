@@ -64,7 +64,7 @@ type MutableScheduler struct {
 	// Error from action is piped into the error channel.
 	action func(ctx context.Context) error
 
-	Logger logutil.Logger
+	Logger logutil.ContextLogger
 
 	// This ensures that action is only called once although the poller determines to run the action again.
 	once *sync.Once
@@ -171,7 +171,7 @@ func (s *MutableScheduler) pollingFunc() {
 
 			if isPaused {
 				if s.PollingTime.Minutes() > 15 {
-					s.Logger.Tracef("scheduler `%s` is paused, skipping action", s.id)
+					s.Logger.TracefCtx(ctx, "scheduler `%s` is paused, skipping action", s.id)
 				}
 				return
 			}
@@ -186,7 +186,7 @@ func (s *MutableScheduler) pollingFunc() {
 
 			if !time.Now().After(next) {
 				if s.PollingTime.Minutes() > 15 {
-					s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
+					s.Logger.TracefCtx(ctx, "scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
 				}
 				return
 			}
@@ -224,7 +224,7 @@ func (s *MutableScheduler) runWithLock(f func(ctx context.Context)) {
 
 	err := s.mu.LockContext(ctx)
 	if err != nil {
-		s.Logger.Tracef("scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
+		s.Logger.TracefCtx(ctx, "scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
 		et := &redsync.ErrTaken{}
 		en := &redsync.ErrNodeTaken{}
 		if !errors.As(err, &et) && !errors.As(err, &en) {
@@ -238,7 +238,7 @@ func (s *MutableScheduler) runWithLock(f func(ctx context.Context)) {
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
-			s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
+			s.Logger.WarnfCtx(unlockCtx, "scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
 			s.sendToCh(err)
 		}
 	}()
@@ -256,7 +256,7 @@ func (s *MutableScheduler) Err() <-chan error {
 func (s *MutableScheduler) Ping(ctx context.Context) error {
 	err := s.Client.Ping(ctx).Err()
 	if err != nil {
-		s.Logger.Warnf("scheduler `%s` cannot ping Redis: %w", s.id, err)
+		s.Logger.WarnfCtx(ctx, "scheduler `%s` cannot ping Redis: %w", s.id, err)
 		return err
 	}
 	return nil
@@ -357,7 +357,7 @@ func (s *MutableScheduler) getNextExecTime(ctx context.Context) (next time.Time,
 	cmd := s.Client.Get(ctx, s.key())
 	result, err := cmd.Int64()
 	if err != nil && !errors.Is(err, redis.Nil) {
-		s.Logger.Warnf("scheduler `%s` cannot retrieve run schedule time from Redis: %s", s.id, err.Error())
+		s.Logger.WarnfCtx(ctx, "scheduler `%s` cannot retrieve run schedule time from Redis: %s", s.id, err.Error())
 		return time.Time{}, err
 	}
 	if errors.Is(err, redis.Nil) {
@@ -388,7 +388,7 @@ func (s *MutableScheduler) setNextExecTimeAuto(ctx context.Context) (err error) 
 	}
 
 	//if s.PollingTime.Minutes() > 15 {
-	s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
+	s.Logger.TracefCtx(ctx, "scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
 	//}
 	return nil
 }
@@ -397,7 +397,7 @@ func (s *MutableScheduler) setNextExecTimeAuto(ctx context.Context) (err error) 
 func (s *MutableScheduler) setNextExecTime(ctx context.Context, next time.Time) (err error) {
 	err = s.Client.Set(ctx, s.key(), next.Unix(), 0).Err()
 	if err != nil {
-		s.Logger.Warnf("scheduler `%s` cannot set initialization time in Redis: %s", s.id, err.Error())
+		s.Logger.WarnfCtx(ctx, "scheduler `%s` cannot set initialization time in Redis: %s", s.id, err.Error())
 		return err
 	}
 
@@ -414,11 +414,11 @@ func (s *MutableScheduler) init(ctx context.Context) error {
 		et := &redsync.ErrTaken{}
 		en := &redsync.ErrNodeTaken{}
 		if errors.As(err, &et) || errors.As(err, &en) {
-			s.Logger.Warnf("scheduler `%s` redis mutex is locked, initializing anyway", s.id)
+			s.Logger.WarnfCtx(ctx, "scheduler `%s` redis mutex is locked, initializing anyway", s.id)
 			return nil
 		}
 
-		s.Logger.Warnf("scheduler `%s` cannot acquire lock: %s", s.id, err.Error())
+		s.Logger.WarnfCtx(ctx, "scheduler `%s` cannot acquire lock: %s", s.id, err.Error())
 		return err
 	}
 
@@ -427,14 +427,14 @@ func (s *MutableScheduler) init(ctx context.Context) error {
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
-			s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
+			s.Logger.WarnfCtx(unlockCtx, "scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
 			return
 		}
 	}()
 
 	_, err = s.getNextExecTime(ctx)
 	if errors.Is(err, redis.Nil) {
-		s.Logger.Tracef("scheduler `%s` has no next exec time, setting", s.id)
+		s.Logger.TracefCtx(ctx, "scheduler `%s` has no next exec time, setting", s.id)
 		err = s.setNextExecTimeAuto(ctx)
 		if err != nil {
 			return err
@@ -465,13 +465,13 @@ func (s *MutableScheduler) Start() error {
 		return err
 	}
 
-	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
+	s.Logger.TracefCtx(ctx, "scheduler `%s` redis connection established for cronutil", s.id)
 	if s.initialPeriod.Minutes() <= 30 {
-		s.Logger.Tracef("scheduler `%s` is using short action period, logging will be reduced", s.id)
+		s.Logger.TracefCtx(ctx, "scheduler `%s` is using short action period, logging will be reduced", s.id)
 	}
 
 	if s.PollingTime.Minutes() <= 15 {
-		s.Logger.Tracef("scheduler `%s` is using short polling time, logging will be reduced", s.id)
+		s.Logger.TracefCtx(ctx, "scheduler `%s` is using short polling time, logging will be reduced", s.id)
 	}
 
 	s.mu = redsync.New(goredis.NewPool(s.Client)).NewMutex(s.mutexKey(), redsync.WithExpiry(s.ActionTimeout))
@@ -573,7 +573,7 @@ func (s *MutableScheduler) UpdatePeriod(period time.Duration, jitter float64) (e
 			return
 		}
 
-		s.Logger.Tracef("scheduler %s next execution time has been updated to %s following request to update period/jitter to %.2f/%.2f", s.id, next.Format(time.RFC3339), period.Seconds(), jitter)
+		s.Logger.TracefCtx(ctx, "scheduler %s next execution time has been updated to %s following request to update period/jitter to %.2f/%.2f", s.id, next.Format(time.RFC3339), period.Seconds(), jitter)
 	})
 
 	return err
@@ -586,7 +586,7 @@ func (s *MutableScheduler) Pause() (err error) {
 		return
 	}
 
-	s.Logger.Tracef("schedluer %s is paused", s.id)
+	s.Logger.Tracef("scheduler %s is paused", s.id)
 
 	return err
 }
@@ -600,7 +600,7 @@ func (s *MutableScheduler) Unpause() (err error) {
 			return
 		}
 
-		s.Logger.Tracef("schedluer %s is unpaused, next exec time is reset", s.id)
+		s.Logger.Tracef("scheduler %s is unpaused, next exec time is reset", s.id)
 
 		err = s.setNextExecTimeAuto(ctx)
 		if err != nil {

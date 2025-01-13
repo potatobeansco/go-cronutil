@@ -62,7 +62,7 @@ type Scheduler struct {
 	// Error from action is piped into the error channel.
 	action func(ctx context.Context) error
 
-	Logger logutil.Logger
+	Logger logutil.ContextLogger
 
 	// This ensures that action is only called once although the poller determines to run the action again.
 	once *sync.Once
@@ -173,7 +173,7 @@ func (s *Scheduler) pollingFunc() {
 
 			if !time.Now().After(next) {
 				if s.AlwaysLog || s.PollingTime.Minutes() > 15 {
-					s.Logger.Tracef("scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
+					s.Logger.TracefCtx(ctx, "scheduler `%s` determined that this is not the right time to execute cronutil action, will execute at %s", s.id, next.Format(time.RFC3339))
 				}
 				return
 			}
@@ -211,7 +211,7 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 
 	err := s.mu.LockContext(ctx)
 	if err != nil {
-		s.Logger.Tracef("scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
+		s.Logger.TracefCtx(ctx, "scheduler `%s` cannot acquire lock: %s, skipping to execute action", s.id, err.Error())
 		et := &redsync.ErrTaken{}
 		en := &redsync.ErrNodeTaken{}
 		if !errors.As(err, &et) && !errors.As(err, &en) {
@@ -225,7 +225,7 @@ func (s *Scheduler) runWithLock(f func(ctx context.Context)) {
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
-			s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
+			s.Logger.WarnfCtx(unlockCtx, "scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
 			s.sendToCh(err)
 		}
 	}()
@@ -307,7 +307,7 @@ func (s *Scheduler) setNextExecTime(ctx context.Context) (err error) {
 	}
 
 	if s.AlwaysLog || s.PollingTime.Minutes() > 15 {
-		s.Logger.Tracef("scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
+		s.Logger.TracefCtx(ctx, "scheduler `%s` next run time set to %s (with added delay for %s)", s.id, next.Format(time.RFC3339), delay.String())
 	}
 	return nil
 }
@@ -322,11 +322,11 @@ func (s *Scheduler) init(ctx context.Context) error {
 		et := &redsync.ErrTaken{}
 		en := &redsync.ErrNodeTaken{}
 		if errors.As(err, &et) || errors.As(err, &en) {
-			s.Logger.Warnf("scheduler `%s` redis mutex is locked, initializing anyway", s.id)
+			s.Logger.WarnfCtx(ctx, "scheduler `%s` redis mutex is locked, initializing anyway", s.id)
 			return nil
 		}
 
-		s.Logger.Warnf("scheduler `%s` cannot acquire lock: %s", s.id, err.Error())
+		s.Logger.WarnfCtx(ctx, "scheduler `%s` cannot acquire lock: %s", s.id, err.Error())
 		return err
 	}
 
@@ -335,7 +335,7 @@ func (s *Scheduler) init(ctx context.Context) error {
 		defer unlockCancel()
 		_, err := s.mu.UnlockContext(unlockCtx)
 		if err != nil {
-			s.Logger.Warnf("scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
+			s.Logger.WarnfCtx(unlockCtx, "scheduler `%s` cannot unlock lock: %s", s.id, err.Error())
 			return
 		}
 	}()
@@ -372,9 +372,9 @@ func (s *Scheduler) Start() error {
 		return err
 	}
 
-	s.Logger.Tracef("scheduler `%s` redis connection established for cronutil", s.id)
+	s.Logger.TracefCtx(ctx, "scheduler `%s` redis connection established for cronutil", s.id)
 	if !s.AlwaysLog && s.PollingTime.Minutes() <= 15 {
-		s.Logger.Tracef("scheduler `%s` is using short polling time, logging will be reduced", s.id)
+		s.Logger.TracefCtx(ctx, "scheduler `%s` is using short polling time, logging will be reduced", s.id)
 	}
 
 	s.mu = redsync.New(goredis.NewPool(s.Client)).NewMutex(s.mutexKey(), redsync.WithExpiry(s.ActionTimeout))
